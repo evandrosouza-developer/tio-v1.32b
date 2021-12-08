@@ -61,6 +61,11 @@ static bool map_o_cr_nl = false;
 static bool map_o_nl_crnl = false;
 static bool map_o_del_bs = false;
 
+//Not global prototypes
+void file_send(void);
+int console_get_filename(char *s, int len);
+char console_getc(void);
+
 #define tio_printf(format, args...) \
 { \
     if (tainted) putchar('\n'); \
@@ -138,6 +143,7 @@ void handle_command_sequence(char input_char, char previous_char, char *output_c
                 tio_printf(" ctrl-t c   Show configuration");
                 tio_printf(" ctrl-t e   Toggle local echo mode");
                 tio_printf(" ctrl-t h   Toggle hexadecimal mode");
+                tio_printf(" ctrl-t f   File (Plain Text Only) send");
                 tio_printf(" ctrl-t l   Clear screen");
                 tio_printf(" ctrl-t q   Quit");
                 tio_printf(" ctrl-t s   Show statistics");
@@ -194,6 +200,10 @@ void handle_command_sequence(char input_char, char previous_char, char *output_c
 
             case KEY_E:
                 option.local_echo = !option.local_echo;
+                break;
+
+            case KEY_F:
+                file_send();
                 break;
 
             case KEY_H:
@@ -800,18 +810,18 @@ int tty_connect(void)
                         delay(option.output_delay);
                     }
 
-                    /* Send output to tty device */
-                    optional_local_echo(output_char);
-                    status = write(fd, &output_char, 1);
-                    if (status < 0)
-                        warning_printf("Could not write to tty device");
-                    fsync(fd);
+					/* Send output to tty device */
+					optional_local_echo(output_char);
+					status = write(fd, &output_char, 1);
+					if (status < 0)
+						warning_printf("Could not write to tty device");
+					fsync(fd);
 
-                    /* Update transmit statistics */
-                    tx_total++;
+					/* Update transmit statistics */
+					tx_total++;
 
-                    /* Insert output delay */
-                    delay(option.output_delay);
+					/* Insert output delay */
+					delay(option.output_delay);
                 }
 
                 /* Save previous key */
@@ -836,4 +846,132 @@ error_read:
     tty_disconnect();
 error_open:
     return TIO_ERROR;
+}
+
+
+void file_send(void) {
+
+	int     status;
+	char    input_char;
+	FILE *fp;
+	char ch;
+	char fname[128];
+	fd_set rdfs;           /* Read file descriptor set */
+	struct timeval tv;
+
+	printf("\r\nEnter file name to send: ");
+	fflush(stdout);
+	console_get_filename(&fname[0], 127);
+	fflush(stdout);
+	printf("\r\n");
+	fflush(stdout);
+ 
+	/* Tie val (not first time: Wait up to 1 second */
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+
+	if ((fp=fopen (fname,"r")) != NULL) {
+		while( (ch = fgetc(fp)) !=EOF) {
+			/* Map newline character */
+			if ( (ch == '\n') && (map_o_nl_crnl) )
+				ch = '\r';
+
+			/* Map output character */
+			if ( (ch == '\r') && (map_o_cr_nl) )
+				ch = '\n';
+
+			status = write(fd, &ch, 1);
+			if (status >= 0)
+			{
+				tx_total ++;
+				delay(option.output_delay);
+			}
+			else 
+			{	warning_printf("Could not write to tty device");}
+		fsync(fd);
+            
+		/* Input from stdin*/
+		status = select(STDIN_FILENO + 1, &rdfs, NULL, NULL, &tv);
+		if (status > 0)
+		{
+			/* Input from stdin ready */
+
+			/* Read one character */
+			status = read(STDIN_FILENO, &input_char, 1);
+			if (status <= 0)
+			{
+				error_printf("Could not read from stdin");
+				exit(EXIT_FAILURE);
+			}
+			if(27 == input_char)
+				break;  //quit while( (ch =fgetc(fp)) !=EOF)
+			}
+		}	//while( (ch =fgetc(fp)) !=EOF) {
+		fclose(fp);
+	}	//if ((fp=fopen (fname,"r")) != NULL) {
+	else
+		printf("File not found!\r\n");
+	fflush(stdout);
+}	//file_send(void)
+
+/*
+ * console_get_filename(char *s, int len)
+ *
+ * Wait for a string to be entered on the console, limited
+ * support for editing characters (back space only)
+ * end when a <CR> character is received.
+ */
+int console_get_filename(char *s, int len)
+{
+	char *t = s;
+	char c;
+	bool valid_fname_char;
+	const char inv_filename_ch[24] = {27,' ','!',34,35,36,37,38,39,'(',')','*','[',']','{','}',';','@','^',60,'=',62}; //<Esc> “!#=$%&‘()*[]{}|;@^<=>
+
+	print = print_normal;
+	*t = '\000';
+	/* read until a <CR> is received */
+	while ((c = console_getc()) != '\r') {
+		/* First check valid characters in filename */
+        valid_fname_char = true;
+        for (int i = 0; i < 23; i++){
+            if(c == inv_filename_ch[i])
+                valid_fname_char = false;
+        }
+		if (c == '\177') {
+			if (t > s) {
+				/* send ^H ^H to erase previous character */
+				putchar('\010'); putchar(' '); putchar('\010');
+				t--;
+			}
+		} else {
+			if (valid_fname_char){
+				*t = c;
+				print(c);
+				if ((t - s) < len) {
+					t++;
+				}
+			}
+		}
+		/* update end of string with NUL */
+		*t = '\000';
+	}
+	fflush(stdout);
+	return t - s;
+}
+
+char console_getc(void)
+{
+	int     status;
+	char    input_char;
+
+	/* Input from stdin ready */
+	status = read(STDIN_FILENO, &input_char, 1);
+	if (status <= 0)
+	{
+		error_printf_silent("Could not read from stdin");
+		tty_disconnect();
+		return TIO_ERROR;
+	}
+	return input_char;
 }
