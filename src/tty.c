@@ -885,7 +885,7 @@ void file_send(void)
 		{
 			//Get next char from file
 			ch = fgetc(fp);	
-			/* Get available input with a tiomeout of 1ms */
+			/* Get available input with a timeout of 1ms */
 			status = select(maxfd, &rdfs, NULL, NULL, &tv);
 			if (status > 0)
 			{
@@ -1013,7 +1013,7 @@ int console_get_filename(char *s, int len)
 				putchar('\010'); putchar(' '); putchar('\010');
 				t--;
 			}
-		}   //if (c == '\177')
+		}   //if (c == 0x7F)
 		else {
 			if (valid_fname_char)
 			{
