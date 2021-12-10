@@ -624,7 +624,7 @@ static void optional_local_echo(char c)
 int tty_connect(void)
 {
     fd_set rdfs;           /* Read file descriptor set */
-    int    maxfd;          /* Maximum file descriptor used */
+	int		maxfd;			/* Maximum file descriptor used */
     char   input_char, output_char;
     static char previous_char = 0;
     static bool first = true;
@@ -700,7 +700,7 @@ int tty_connect(void)
     }
 #endif
 
-    maxfd = MAX(fd, STDIN_FILENO) + 1;  /* Maximum bit entry (fd) to test */
+	maxfd = MAX(fd, STDIN_FILENO) + 1;  /* Maximum bit entry (fd) to test */
 
     /* Input loop */
     while (true)
@@ -849,70 +849,133 @@ error_open:
 }
 
 
-void file_send(void) {
+#define X_ON	17
+#define X_OFF	19
 
-	int     status;
-	char    input_char;
-	FILE *fp;
-	char ch;
-	char fname[128];
-	fd_set rdfs;           /* Read file descriptor set */
-	struct timeval tv;
+void file_send(void)
+{
+	int		status, state;
+	int		maxfd;						// Maximum file descriptor used
+	char    in_ch_stdin, in_ch_tty, ch, fname[256];
+	FILE    *fp;
+	fd_set  rdfs;						// Read file descriptor set
+	struct  timeval tv;
+	bool    x_on_state = true;			//TX can go on (No flow control, no X_OFF received or no HW protocol)
+	long	fileSize, iter;
 
-	printf("\r\nEnter file name to send: ");
-	fflush(stdout);
-	console_get_filename(&fname[0], 127);
+	console_get_filename(&fname[0], 255);
 	fflush(stdout);
 	printf("\r\n");
 	fflush(stdout);
  
 	/* Tie val (not first time: Wait up to 1 second */
-	tv.tv_sec = 1;
-	tv.tv_usec = 0;
+	tv.tv_sec = 0;
+	tv.tv_usec = 1000;
 
-	if ((fp=fopen (fname,"r")) != NULL) {
-		while( (ch = fgetc(fp)) !=EOF) {
-			/* Map newline character */
-			if ( (ch == '\n') && (map_o_nl_crnl) )
-				ch = '\r';
+	maxfd = MAX(fd, STDIN_FILENO) + 1;  /* Maximum bit entry (fd) to test */
 
-			/* Map output character */
-			if ( (ch == '\r') && (map_o_cr_nl) )
-				ch = '\n';
+	if ((fp=fopen (fname,"r")) != NULL)
+	{
+		/* Get file size */
+		fseek(fp, 0, SEEK_END);
+		fileSize = ftell(fp);
+		fseek(fp, 0, SEEK_SET);// Positioning to read from the beginning of file
 
-			status = write(fd, &ch, 1);
-			if (status >= 0)
-			{
-				tx_total ++;
-				delay(option.output_delay);
-			}
-			else 
-			{	warning_printf("Could not write to tty device");}
-		fsync(fd);
-            
-		/* Input from stdin*/
-		status = select(STDIN_FILENO + 1, &rdfs, NULL, NULL, &tv);
-		if (status > 0)
+		for(iter = 0; iter < fileSize; iter++)
 		{
-			/* Input from stdin ready */
-
-			/* Read one character */
-			status = read(STDIN_FILENO, &input_char, 1);
-			if (status <= 0)
+			//Get next char from file
+			ch = fgetc(fp);	
+			/* Get available input with a tiomeout of 1ms */
+			status = select(maxfd, &rdfs, NULL, NULL, &tv);
+			if (status > 0)
 			{
-				error_printf("Could not read from stdin");
-				exit(EXIT_FAILURE);
+				if (FD_ISSET(fd, &rdfs))
+				{
+					/* Input from tty device ready */
+					if (read(fd, &in_ch_tty, 1) > 0)
+					{
+						/* Update receive statistics */
+						rx_total++;
+					}
+				}
+
+				/* Allows user to abort send file operation - read from stdin */
+				if (FD_ISSET(STDIN_FILENO, &rdfs))
+				{
+					/* Input from stdin ready */
+					status = read(STDIN_FILENO, &in_ch_stdin, 1);
+					if (status <= 0)
+					{
+						error_printf("Could not read from stdin");
+						exit(EXIT_FAILURE);
+					}
+					if(27 == in_ch_stdin)
+						break;  //quit while( (ch =fgetc(fp)) !=EOF)
+				}   //if (status > 0)
+			}	//if(select(maxfd, &rdfs, NULL, NULL, NULL)>0)
+
+			/* Read transmission's clearance */
+			//First of all, check if Flow Control is off
+			if(!((tio.c_cflag & CRTSCTS) || (tio.c_iflag & (IXON | IXOFF))))
+				x_on_state = true;
+			else
+			{
+				//if Flow Control is ON, check if is Hardware Flow 
+				if(tio.c_cflag & CRTSCTS)
+				{
+					//Replicate CTS state to x_on_state
+					if (ioctl(fd, TIOCMGET, &state) < 0)
+					{
+						error_printf("Could not get line state: %s", strerror(errno));
+						break;
+					}
+					x_on_state = (state & TIOCM_CTS) ? true : false;
+				}
+				else
+				{
+					//Flow Control is SW: Start cycle is always X_ON. If received is X_OFF, wait for a X_ON to het a new clearance
+					if( (((tio.c_iflag & IXON) == IXON) || ((tio.c_iflag & IXOFF) == IXOFF)) )
+					{
+						if(x_on_state && (in_ch_tty == X_OFF))
+							x_on_state = false;
+						else if(!x_on_state && (in_ch_tty == X_ON))
+							x_on_state = true;
+					}
+				}
 			}
-			if(27 == input_char)
-				break;  //quit while( (ch =fgetc(fp)) !=EOF)
-			}
-		}	//while( (ch =fgetc(fp)) !=EOF) {
+
+			/* Prepare data and send it, if cleared */
+			if(x_on_state)
+			{
+				/* Map newline character */
+				if ( (ch == '\n') && (map_o_nl_crnl) )
+					ch = '\r';
+
+				/* Map output character */
+				if ( (ch == '\r') && (map_o_cr_nl) )
+					ch = '\n';
+
+				status = write(fd, &ch, 1);
+				if (status >= 0)
+				{
+					tx_total ++;
+					delay(option.output_delay);
+				}
+				else 
+				{	
+					warning_printf("Could not write to tty device");
+				}
+				fsync(fd);
+			}	//if(x_on_state)
+            fflush(stdout);
+		}	//for(iter = 0; iter < fileSize; iter++)
 		fclose(fp);
 	}	//if ((fp=fopen (fname,"r")) != NULL) {
 	else
 		printf("File not found!\r\n");
 	fflush(stdout);
 }	//file_send(void)
+
 
 /*
  * console_get_filename(char *s, int len)
@@ -928,37 +991,45 @@ int console_get_filename(char *s, int len)
 	bool valid_fname_char;
 	const char inv_filename_ch[24] = {27,' ','!',34,35,36,37,38,39,'(',')','*','[',']','{','}',';','@','^',60,'=',62}; //<Esc> “!#=$%&‘()*[]{}|;@^<=>
 
+	printf("\r\nEnter file name to send: ");
+	fflush(stdout);
 	print = print_normal;
 	*t = '\000';
 	/* read until a <CR> is received */
-	while ((c = console_getc()) != '\r') {
+	while ((c = console_getc()) != '\r')
+	{
 		/* First check valid characters in filename */
-        valid_fname_char = true;
-        for (int i = 0; i < 23; i++){
-            if(c == inv_filename_ch[i])
-                valid_fname_char = false;
-        }
-		if (c == '\177') {
-			if (t > s) {
+		valid_fname_char = true;
+		for (int i = 0; i < 23; i++)
+		{
+			if(c == inv_filename_ch[i])
+			valid_fname_char = false;
+		}
+		if (c == '\177')
+		{
+			if (t > s)
+			{
 				/* send ^H ^H to erase previous character */
 				putchar('\010'); putchar(' '); putchar('\010');
 				t--;
 			}
-		} else {
-			if (valid_fname_char){
+		}   //if (c == '\177')
+		else {
+			if (valid_fname_char)
+			{
 				*t = c;
 				print(c);
-				if ((t - s) < len) {
+				if ((t - s) < len)
 					t++;
-				}
 			}
-		}
+		}   //else if (c == '\177')
 		/* update end of string with NUL */
 		*t = '\000';
-	}
+	}   //while ((c = console_getc()) != '\r')
 	fflush(stdout);
 	return t - s;
 }
+
 
 char console_getc(void)
 {
