@@ -45,8 +45,10 @@
 #include "tio/error.h"
 
 #ifdef HAVE_TERMIOS2
-extern int setspeed2(int fd, int baudrate);
+extern int setspeed2(int tty_fd, int baudrate);
 #endif
+
+#define TIO_ABORT	0x1B
 
 static struct termios tio, tio_old, stdout_new, stdout_old, stdin_new, stdin_old;
 static unsigned long rx_total = 0, tx_total = 0;
@@ -55,7 +57,7 @@ static bool tainted = false;
 static bool print_mode = NORMAL;
 static bool standard_baudrate = true;
 static void (*print)(char c);
-static int fd;
+static int tty_fd;
 static bool map_i_nl_crnl = false;
 static bool map_o_cr_nl = false;
 static bool map_o_nl_crnl = false;
@@ -94,7 +96,7 @@ static void toggle_line(const char *line_name, int mask)
 {
     int state;
 
-    if (ioctl(fd, TIOCMGET, &state) < 0)
+    if (ioctl(tty_fd, TIOCMGET, &state) < 0)
     {
         error_printf("Could not get line state: %s", strerror(errno));
     }
@@ -110,7 +112,7 @@ static void toggle_line(const char *line_name, int mask)
             state |= mask;
             tio_printf("set %s to HIGH", line_name);
         }
-        if (ioctl(fd, TIOCMSET, &state) < 0)
+        if (ioctl(tty_fd, TIOCMSET, &state) < 0)
             error_printf("Could not set line state: %s", strerror(errno));
     }
 }
@@ -156,7 +158,7 @@ void handle_command_sequence(char input_char, char previous_char, char *output_c
                 break;
 
             case KEY_SHIFT_L:
-                if (ioctl(fd, TIOCMGET, &state) < 0)
+                if (ioctl(tty_fd, TIOCMGET, &state) < 0)
                 {
                     error_printf("Could not get line state: %s", strerror(errno));
                     break;
@@ -178,7 +180,7 @@ void handle_command_sequence(char input_char, char previous_char, char *output_c
                 break;
 
             case KEY_B:
-                tcsendbreak(fd, 0);
+                tcsendbreak(tty_fd, 0);
                 break;
 
             case KEY_C:
@@ -323,7 +325,9 @@ void stdout_configure(void)
 
     /* Control characters */
     stdout_new.c_cc[VTIME] = 0; /* Inter-character timer unused */
-    stdout_new.c_cc[VMIN]  = 1; /* Blocking read until 1 character received */
+    //stdout_new.c_cc[VMIN]  = 1; /* Blocking read until 1 character received */
+    stdout_new.c_cc[VMIN]  = 0; /* From Evandro: Non blocking read */
+
 
     /* Activate new stdout settings */
     status = tcsetattr(STDOUT_FILENO, TCSANOW, &stdout_new);
@@ -483,11 +487,13 @@ void tty_configure(void)
     /* Control, input, output, local modes for tty device */
     tio.c_cflag |= CLOCAL | CREAD;
     tio.c_oflag = 0;
+    //Canonical mode is disabled, echo, erasure, new-line echo, disable interpretation of INTR, QUIT and SUSP
     tio.c_lflag = 0;
 
     /* Control characters */
     tio.c_cc[VTIME] = 0; // Inter-character timer unused
-    tio.c_cc[VMIN]  = 1; // Blocking read until 1 character received
+    //tio.c_cc[VMIN]  = 1; // Blocking read until 1 character received
+    tio.c_cc[VMIN]  = 0; // From Evandro: No blocking read
 
     /* Configure any specified input or output mappings */
     buffer = strdup(option.map);
@@ -562,16 +568,20 @@ void tty_wait_for_device(void)
 
             /* Read one character */
             status = read(STDIN_FILENO, &input_char, 1);
-            if (status <= 0)
+			//if (status <= 0)
+			if (status < 0)
             {
                 error_printf("Could not read from stdin");
                 exit(EXIT_FAILURE);
             }
 
-            /* Handle commands */
-            handle_command_sequence(input_char, previous_char, NULL, NULL);
+			if (status > 0)	//From Evandro: New, as altertion to non blocking read
+			{
+				/* Handle commands */
+				handle_command_sequence(input_char, previous_char, NULL, NULL);
 
-            previous_char = input_char;
+				previous_char = input_char;
+			}
 
         } else if (status == -1)
         {
@@ -597,15 +607,15 @@ void tty_disconnect(void)
     if (connected)
     {
         tio_printf("Disconnected");
-        flock(fd, LOCK_UN);
-        close(fd);
+        flock(tty_fd, LOCK_UN);
+        close(tty_fd);
         connected = false;
     }
 }
 
 void tty_restore(void)
 {
-    tcsetattr(fd, TCSANOW, &tio_old);
+    tcsetattr(tty_fd, TCSANOW, &tio_old);
 
     if (connected)
         tty_disconnect();
@@ -623,7 +633,7 @@ static void optional_local_echo(char c)
 
 int tty_connect(void)
 {
-    fd_set rdfs;           /* Read file descriptor set */
+    fd_set rdfs;			/* Read file descriptor set */
 	int		maxfd;			/* Maximum file descriptor used */
     char   input_char, output_char;
     static char previous_char = 0;
@@ -634,25 +644,25 @@ int tty_connect(void)
 
     /* Open tty device */
 #ifdef __APPLE__
-    fd = open(option.tty_device, O_RDWR | O_NOCTTY | O_NONBLOCK );
+    tty_fd = open(option.tty_device, O_RDWR | O_NOCTTY | O_NONBLOCK );
 #else
-    fd = open(option.tty_device, O_RDWR | O_NOCTTY);
+    tty_fd = open(option.tty_device, O_RDWR | O_NOCTTY);
 #endif
-    if (fd < 0)
+    if (tty_fd < 0)
     {
         error_printf_silent("Could not open tty device (%s)", strerror(errno));
         goto error_open;
     }
 
     /* Make sure device is of tty type */
-    if (!isatty(fd))
+    if (!isatty(tty_fd))
     {
         error_printf("Not a tty device");
         exit(EXIT_FAILURE);;
     }
 
     /* Lock device file */
-    status = flock(fd, LOCK_EX | LOCK_NB);
+    status = flock(tty_fd, LOCK_EX | LOCK_NB);
     if ((status == -1) && (errno == EWOULDBLOCK))
     {
         error_printf("Device file is locked by another process");
@@ -660,7 +670,7 @@ int tty_connect(void)
     }
 
     /* Flush stale I/O data (if any) */
-    tcflush(fd, TCIOFLUSH);
+    tcflush(tty_fd, TCIOFLUSH);
 
     /* Print connect status */
     tio_printf("Connected");
@@ -671,7 +681,7 @@ int tty_connect(void)
         next_timestamp = time(NULL);
 
     /* Save current port settings */
-    if (tcgetattr(fd, &tio_old) < 0)
+    if (tcgetattr(tty_fd, &tio_old) < 0)
         goto error_tcgetattr;
 
     /* Make sure we restore tty settings on exit */
@@ -682,7 +692,7 @@ int tty_connect(void)
     }
 
     /* Activate new port settings */
-    status = tcsetattr(fd, TCSANOW, &tio);
+    status = tcsetattr(tty_fd, TCSANOW, &tio);
     if (status == -1)
     {
         error_printf_silent("Could not apply port settings (%s)", strerror(errno));
@@ -692,7 +702,7 @@ int tty_connect(void)
 #ifdef HAVE_TERMIOS2
     if (!standard_baudrate)
     {
-        if (setspeed2(fd, option.baudrate) != 0)
+        if (setspeed2(tty_fd, option.baudrate) != 0)
         {
             error_printf_silent("Could not set baudrate speed (%s)", strerror(errno));
             goto error_setspeed2;
@@ -700,23 +710,23 @@ int tty_connect(void)
     }
 #endif
 
-	maxfd = MAX(fd, STDIN_FILENO) + 1;  /* Maximum bit entry (fd) to test */
+	maxfd = MAX(tty_fd, STDIN_FILENO) + 1;  /* Maximum bit entry (tty_fd) to test */
 
     /* Input loop */
     while (true)
     {
         FD_ZERO(&rdfs);
-        FD_SET(fd, &rdfs);
+        FD_SET(tty_fd, &rdfs);
         FD_SET(STDIN_FILENO, &rdfs);
 
         /* Block until input becomes available */
         status = select(maxfd, &rdfs, NULL, NULL, NULL);
         if (status > 0)
         {
-            if (FD_ISSET(fd, &rdfs))
+            if (FD_ISSET(tty_fd, &rdfs))
             {
                 /* Input from tty device ready */
-                if (read(fd, &input_char, 1) > 0)
+                if (read(tty_fd, &input_char, 1) > 0)
                 {
                     /* Update receive statistics */
                     rx_total++;
@@ -752,7 +762,7 @@ int tty_connect(void)
                         /* Print received tty character to stdout */
                         print(input_char);
                     }
-                    fflush(stdout);
+                    //fflush(stdout);
 
                     /* Write to log */
                     if (option.log)
@@ -802,7 +812,7 @@ int tty_connect(void)
                         char r = '\r';
 
                         optional_local_echo(r);
-                        status = write(fd, &r, 1);
+                        status = write(tty_fd, &r, 1);
                         if (status < 0)
                             warning_printf("Could not write to tty device");
 
@@ -812,10 +822,10 @@ int tty_connect(void)
 
 					/* Send output to tty device */
 					optional_local_echo(output_char);
-					status = write(fd, &output_char, 1);
+					status = write(tty_fd, &output_char, 1);
 					if (status < 0)
 						warning_printf("Could not write to tty device");
-					fsync(fd);
+					fsync(tty_fd);
 
 					/* Update transmit statistics */
 					tx_total++;
@@ -848,114 +858,134 @@ error_open:
     return TIO_ERROR;
 }
 
+/****************************************************************************************************/
+/****************************************************************************************************/
+/***** From Evandro: beggining with this point, there are my code to manage send file from tio. *****/
+/****************************************************************************************************/
+/****************************************************************************************************/
 
 #define X_ON	17
 #define X_OFF	19
 
 void file_send(void)
 {
-	int		status, state;
-	int		maxfd;						// Maximum file descriptor used
-	char    in_ch_stdin, in_ch_tty, ch, fname[256];
+	int		status, state, rx_tty_received;
+	char    ch_stdin, ch_tty_in[64], ch_file_in, fname[256];
 	FILE    *fp;
-	fd_set  rdfs;						// Read file descriptor set
-	struct  timeval tv;
-	bool    x_on_state = true;			//TX can go on (No flow control, no X_OFF received or no HW protocol)
 	long	fileSize, iter;
+	bool    x_on_state;								//TX go flag
+	bool    hw_flow_ctrl = false;
+	bool    sw_flow_ctrl = false;
 
-	console_get_filename(&fname[0], 255);
-	fflush(stdout);
+	//First of all, identify type of Flow Control used
+	if(!((tio.c_cflag & CRTSCTS) || (tio.c_iflag & (IXON | IXOFF))))
+		//Flow Control is NONE
+		x_on_state = true;
+	else
+	{
+		//Flow Control is ON
+		if(tio.c_cflag & CRTSCTS)
+		{
+			//Flow Control is Hardware: Replicate CTS state to x_on_state
+			hw_flow_ctrl = true;
+		}
+		else
+		{
+			//Flow Control is SW: If received is X_OFF, lock TX, than wait for a X_ON to get a new clearance
+			if( (((tio.c_iflag & IXON) == IXON) || ((tio.c_iflag & IXOFF) == IXOFF)) )
+				sw_flow_ctrl = true;
+		}
+	}
+
+	//Get from user the file name to transmit
+	status = console_get_filename(&fname[0], 255);
+	if (status == 0)
+	{
+		//Aborted
+		printf("\r\nSend file aborted!\r\n");
+		return;
+	}
 	printf("\r\n");
 	fflush(stdout);
  
-	/* Tie val (not first time: Wait up to 1 second */
-	tv.tv_sec = 0;
-	tv.tv_usec = 1000;
-
-	maxfd = MAX(fd, STDIN_FILENO) + 1;  /* Maximum bit entry (fd) to test */
-
 	if ((fp=fopen (fname,"r")) != NULL)
 	{
 		/* Get file size */
 		fseek(fp, 0, SEEK_END);
 		fileSize = ftell(fp);
-		fseek(fp, 0, SEEK_SET);// Positioning to read from the beginning of file
+		fseek(fp, 0, SEEK_SET);						//Positioning to read from the beginning of file
+		
+		iter = 0;
+		//Get first char from file
+		ch_file_in = fgetc(fp);
+		x_on_state = true;							//Starts with "TX can go on"
 
-		for(iter = 0; iter < fileSize; iter++)
+		while(iter < fileSize)
 		{
-			//Get next char from file
-			ch = fgetc(fp);	
-			/* Get available input with a timeout of 1ms */
-			status = select(maxfd, &rdfs, NULL, NULL, &tv);
-			if (status > 0)
+			/* Input from tty device ready */
+			rx_tty_received = read(tty_fd, &ch_tty_in, sizeof(ch_tty_in));
+			if (rx_tty_received > 0)
 			{
-				if (FD_ISSET(fd, &rdfs))
-				{
-					/* Input from tty device ready */
-					if (read(fd, &in_ch_tty, 1) > 0)
-					{
-						/* Update receive statistics */
-						rx_total++;
-					}
-				}
+				/* Update receive statistics */
+				rx_total += rx_tty_received;
+				/* Print received tty character to stdout */
+				for (int i = 0; i < rx_tty_received; i++)
+					print(ch_tty_in[i]);
+			}
 
-				/* Allows user to abort send file operation - read from stdin */
-				if (FD_ISSET(STDIN_FILENO, &rdfs))
-				{
-					/* Input from stdin ready */
-					status = read(STDIN_FILENO, &in_ch_stdin, 1);
-					if (status <= 0)
-					{
-						error_printf("Could not read from stdin");
-						exit(EXIT_FAILURE);
-					}
-					if(27 == in_ch_stdin)
-						break;  //quit while( (ch =fgetc(fp)) !=EOF)
-				}   //if (status > 0)
-			}	//if(select(maxfd, &rdfs, NULL, NULL, NULL)>0)
+            /* Allows user to abort send file operation - read from stdin */
+            status = read(STDIN_FILENO, &ch_stdin, 1);
+            if (status < 0)
+            {
+                error_printf("Could not read from stdin");
+                exit(EXIT_FAILURE);
+            }
+            if ( (status > 0) && (TIO_ABORT == ch_stdin) )
+            {
+                printf("\r\nSend file aborted!\r\n");
+                break;								//quit while( (ch_file_in =fgetc(fp)) !=EOF)
+            }
 
 			/* Read transmission's clearance */
-			//First of all, check if Flow Control is off
-			if(!((tio.c_cflag & CRTSCTS) || (tio.c_iflag & (IXON | IXOFF))))
-				x_on_state = true;
-			else
+			//Flow Control is ON
+			if(hw_flow_ctrl)
 			{
-				//if Flow Control is ON, check if is Hardware Flow 
-				if(tio.c_cflag & CRTSCTS)
+				//Flow Control is Hardware: Replicate CTS state to x_on_state
+				if (ioctl(tty_fd, TIOCMGET, &state) < 0)
 				{
-					//Replicate CTS state to x_on_state
-					if (ioctl(fd, TIOCMGET, &state) < 0)
-					{
-						error_printf("Could not get line state: %s", strerror(errno));
-						break;
-					}
-					x_on_state = (state & TIOCM_CTS) ? true : false;
+					error_printf("Could not get line state: %s", strerror(errno));
+					break;
 				}
 				else
+					x_on_state = (state & TIOCM_CTS);
+			}	//if(hw_flow_ctrl)
+			else
+			{
+				//Flow Control is SW: If received is X_OFF, lock TX, than wait for a X_ON to get a new clearance
+				if(sw_flow_ctrl)
 				{
-					//Flow Control is SW: Start cycle is always X_ON. If received is X_OFF, wait for a X_ON to het a new clearance
-					if( (((tio.c_iflag & IXON) == IXON) || ((tio.c_iflag & IXOFF) == IXOFF)) )
+					for (int i = 0; i < rx_tty_received; i++)
 					{
-						if(x_on_state && (in_ch_tty == X_OFF))
+						if(x_on_state && (ch_tty_in[i] == X_OFF))
 							x_on_state = false;
-						else if(!x_on_state && (in_ch_tty == X_ON))
+						else if(!x_on_state && (ch_tty_in[i] == X_ON))
 							x_on_state = true;
-					}
-				}
-			}
+					}	//for (int i = 0; i < rx_tty_received; i++)
+				}	//if(sw_flow_ctrl)
+			}	//else if(hw_flow_ctrl)
 
 			/* Prepare data and send it, if cleared */
 			if(x_on_state)
 			{
 				/* Map newline character */
-				if ( (ch == '\n') && (map_o_nl_crnl) )
-					ch = '\r';
+				if ( (ch_file_in == '\n') && (map_o_nl_crnl) )
+					ch_file_in = '\r';
 
 				/* Map output character */
-				if ( (ch == '\r') && (map_o_cr_nl) )
-					ch = '\n';
+				if ( (ch_file_in == '\r') && (map_o_cr_nl) )
+					ch_file_in = '\n';
 
-				status = write(fd, &ch, 1);
+				status = write(tty_fd, &ch_file_in, 1);
 				if (status >= 0)
 				{
 					tx_total ++;
@@ -965,16 +995,17 @@ void file_send(void)
 				{	
 					warning_printf("Could not write to tty device");
 				}
-				fsync(fd);
+				fsync(tty_fd);						//update log file
+				
+				ch_file_in = fgetc(fp);				//Get next char from file to transmit
+				iter++;
 			}	//if(x_on_state)
-            fflush(stdout);
-		}	//for(iter = 0; iter < fileSize; iter++)
+		}	//while(iter < fileSize)
 		fclose(fp);
-	}	//if ((fp=fopen (fname,"r")) != NULL) {
+	}	//if ((fp=fopen (fname,"r")) != NULL)
 	else
-		printf("File not found!\r\n");
-	fflush(stdout);
-}	//file_send(void)
+		error_printf("File not found!\r\n");
+}	//file_send(void) 1
 
 
 /*
@@ -982,14 +1013,16 @@ void file_send(void)
  *
  * Wait for a string to be entered on the console, limited
  * support for editing characters (back space only)
- * end when a <CR> character is received.
+ * end when a <CR> character is received. Functio aborted with an <Esc>
+ * 
+ * It returns the number of chars in buffer
  */
 int console_get_filename(char *s, int len)
 {
-	char *t = s;
-	char c;
-	bool valid_fname_char;
-	const char inv_filename_ch[24] = {27,' ','!',34,35,36,37,38,39,'(',')','*','[',']','{','}',';','@','^',60,'=',62}; //<Esc> “!#=$%&‘()*[]{}|;@^<=>
+	char	*t = s;
+	char	c;
+	bool	valid_fname_char;
+	const	char inv_filename_ch[24] = {27,' ','!',34,35,36,37,38,39,'(',')','*','[',']','{','}',';','@','^',60,'=',62}; //<Esc> “!#=$%&‘()*[]{}|;@^<=>
 
 	printf("\r\nEnter file name to send: ");
 	fflush(stdout);
@@ -1005,12 +1038,12 @@ int console_get_filename(char *s, int len)
 			if(c == inv_filename_ch[i])
 			valid_fname_char = false;
 		}
-		if (c == '\177')
+		if (c == 0x7F)  //Backspace
 		{
 			if (t > s)
 			{
 				/* send ^H ^H to erase previous character */
-				putchar('\010'); putchar(' '); putchar('\010');
+				putchar(8); putchar(' '); putchar(8);
 				t--;
 			}
 		}   //if (c == 0x7F)
@@ -1022,11 +1055,14 @@ int console_get_filename(char *s, int len)
 				if ((t - s) < len)
 					t++;
 			}
-		}   //else if (c == '\177')
+		}   //else if (c == 0x7F)
+		if (c == 0x1B)  //Esc
+		{
+			return 0;
+		}   //if (c == 0x1B)
 		/* update end of string with NUL */
 		*t = '\000';
-	}   //while ((c = console_getc()) != '\r')
-	fflush(stdout);
+	}   //while (c = console_getc()) != '\r')
 	return t - s;
 }
 
@@ -1036,13 +1072,17 @@ char console_getc(void)
 	int     status;
 	char    input_char;
 
-	/* Input from stdin ready */
-	status = read(STDIN_FILENO, &input_char, 1);
-	if (status <= 0)
+	status = 0; //force to enter the loop
+	while(status < 1)
 	{
-		error_printf_silent("Could not read from stdin");
-		tty_disconnect();
-		return TIO_ERROR;
+		/* Check input from stdin. It is inside a whiles because now it is a non blocking function */
+		status = read(STDIN_FILENO, &input_char, 1);
+		if (status < 0)
+		{
+			error_printf_silent("Could not read from stdin");
+			tty_disconnect();
+			return TIO_ABORT;
+		}
 	}
 	return input_char;
 }
