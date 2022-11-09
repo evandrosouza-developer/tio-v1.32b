@@ -8,6 +8,13 @@
 tio is a simple TTY terminal application which features a straightforward
 commandline interface to easily connect to TTY devices for basic input/output.
 
+Getting its simplicity, I made two additions:
+1) File send capability, to be feasible upgrade a new Database to PS2 ro MSX
+   board Converter, that you call ^T K;
+2) Test and visualize the full implemention, by using all tools:
+  . PS2 to MSX Keyboard Converter;
+  . MSX Keyboard Subsystem Emulator and Tester;
+  . This functionality shows all MSX Keyboard matrix and shows pressed keys, called by ^T k..
 It was created because the author needed a simple no-nonsense TTY terminal
 application to easily connect to various terminal TTY devices.
 
